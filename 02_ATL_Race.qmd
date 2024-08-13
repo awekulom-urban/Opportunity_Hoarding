@@ -1,0 +1,255 @@
+---
+title: "Child Opportunity in Atlantas"
+execute:
+  warning: false
+format:
+  html:
+    embed-resources: true
+    self-contained-math: true
+    toc: true
+    toc-depth: 4
+    fig-wideth: 12
+    fig-height: 6
+    code-fold: true
+    code-summary: "Click to Show Code"
+    code-tools: true
+editor: visual
+---
+
+## Setup Code
+
+```{r}
+#This code creates tables for racial demographics and the county and city level for the Atlanta Metro in Fulton, DeKalb, and Gwinnett county
+
+
+
+#Library Statements
+knitr::opts_chunk$set(echo = FALSE)
+
+librarian::shelf(tidyverse, tidycensus, tigris, sf, janitor, skimr, urbnthemes, urbnmapr, writexl, readxl, readr, ggrepel, kableExtra, fst, plotly, tidylog, dotenv) 
+options(tigris_class = "sf")
+options(tigris_use_cache = TRUE)
+set_urbn_defaults(style = "print")
+census_api_key(, install = TRUE, overwrite = TRUE) #insert API-key
+```
+
+## Importing Data
+
+```{r}
+#COI datafiles
+coi <- read_csv("Data/1_index.csv")
+
+#Municipal Incorporation Indicator census tract and Municipality dataset
+municip <- read_csv("exports/muni-incorp-full.csv") %>%
+  filter(yr_incorp >=2000, state_abbv == 'GA') %>%
+  arrange(yr_incorp) %>%
+  rename(state_fips = statefips)
+ga_census_tract <- read_excel("Data/Georgia_Census Tracts.xlsx", sheet = "Georgia_Census Tracts") %>%
+  filter(state != 'State code') %>%
+  mutate(tract= as.numeric(tract)) %>%
+  mutate(tract = sprintf("%.2f", tract))%>% 
+  mutate(tract = as.numeric(tract)) %>%
+  mutate(PlaceName = gsub("city, GA", "", PlaceName)) %>%
+  mutate(CountyName = str_remove_all(CountyName, " GA")) %>%
+  mutate(CountyName = str_to_title(CountyName)) %>%
+  filter(CountyName %in% c('Fulton', 'Dekalb', 'Gwinnett')) %>%
+  arrange(desc(`municipal incorporation indicator`)) %>%
+  mutate(keep_row = if_else(`municipal incorporation indicator` == 1, 
+                            !duplicated(tract), 
+                            TRUE))%>%  
+  group_by(tract) %>%
+  mutate(id = row_number()) %>%
+  ungroup() %>%distinct(tract,.keep_all = TRUE) %>%
+  rename("state_fips"  = state, 
+         "state_abbv"  = stab, 
+         "county_fips" = county,
+         placecity= place, 
+         city = PlaceName) %>%
+  select(-keep_row, -id, -pop20, -afact)
+
+
+#Census tracts to GEOID20
+fulton_tract<- read_delim(file = "Data/census_2020/Fulton_tract_geoid20.txt", delim = ";", col_names = TRUE)  %>%
+  select(-STATE, -COUNTY)
+gwinnett_tract <- read_delim(file = "Data/census_2020/Gwinnett_tract_geoid20.txt", delim = ";", col_names = TRUE) %>%
+  select(-STATE, -COUNTY)
+dekalb_tract <- read_delim(file = "Data/census_2020/Dekalb_tract_geoid20.txt", delim = ";", col_names = TRUE) %>%
+  select(-STATE,-COUNTY)
+
+
+#appending datasets
+tract_geoid20 <- bind_rows(fulton_tract, gwinnett_tract, dekalb_tract) %>%
+  select(-TYPE, -SHEETS) %>%
+  mutate(FULLCODE = as.character(FULLCODE)) %>%
+  rename(tract = TRACT, geoid20 = FULLCODE)
+
+#ACS variables -> Income and Racial Population
+p9 <- load_variables("pl", year = 2022)
+
+
+#selecting race variables at the place level:
+
+race_vars <- c(pacific = "P2_009N" , 
+               asian = "P2_008N", 
+               aian = "P2_007N", 
+               black = "P2_006N", 
+               white = "P2_005N",
+               hisp = "P2_002N" , 
+               other = 'P2_010N' , 
+               multi = 'P2_011N', 
+               total = "P2_001N")
+  
+
+inc <- c(med_inc = "S1901_C01_012")
+
+
+#Pulling race variables  from decennial cenus year 2020 at place level
+acs_dem <- get_decennial(geography ="place",
+                         race_vars,
+                        state = "GA" )
+  
+  load_variables("acs5/profile",year = 2020)
+
+
+
+
+
+#Pulling median income variable from ACS at place level year 2022
+acs_tract <- get_acs(geography = "place",
+                 variables = inc, # Total population
+                 state = "GA",
+                 year = 2022, 
+                 survey = "acs5") %>% select(-moe)%>%
+  pivot_wider(names_from = variable, values_from = estimate)%>%
+  rename(geoid = GEOID)
+
+
+#County Data
+
+#pulling race variables from decennial census year 2020 at county level
+acs_dem_county <- get_decennial(geography ="county",
+                         race_vars,
+                        state = "GA" )
+
+#Pulling median income variables from ACS at county level year 2022
+
+acs_county <- get_acs(geography = "county",
+                 variables = inc, # Total population
+                 state = "GA",
+                 year = 2022, 
+                 survey = "acs5") %>% select(-moe)%>%
+  pivot_wider(names_from = variable, values_from = estimate)%>%
+  rename(geoid = GEOID)
+
+
+
+  
+  
+```
+
+## Merging the Files
+
+```{r}
+
+#identifying the Atlanta counties of interest > Metro_fips == 12060
+#ACS variables
+
+# Creating Merging columns
+
+merge_cols <- c('geoid20', 'year', 'state_fips', 'state_usps', 'state_name', 
+                'county_fips', 'county_name', 'metro_fips', 'metro_name', 
+                'metro_type')
+race_cat <- c('total' , 'other','aian', 'asian','black', 'hisp' , 'white', 'multi')
+
+#all Georgia fips with COI index
+atl <- coi %>% 
+    filter(state_fips == "13" & metro_fips == 12060) %>%
+    select(all_of(merge_cols),
+           r_COI_nat, r_COI_stt, r_COI_met, c5_COI_met) %>% 
+          filter(year == 2021) %>% 
+          rename(state_abbv = state_usps) 
+
+
+
+#Municipality/City level data
+  #merge should match on 210 tractcs
+
+place_data <- ga_census_tract %>%
+  left_join(tract_geoid20, by = "tract") %>%
+  arrange(tract, `municipal incorporation indicator`) %>%
+  right_join(municip, by = c('state_fips', 'state_abbv','placecity')) %>%
+  left_join(atl, by = c("geoid20", "county_fips", "state_fips", "state_abbv")) %>%
+  select(-starts_with("r"), -county_name, -CountyName, -state_name, -state_fips, ,-metro_name, -state_abbv, -metro_fips, -metro_type, -statename) 
+
+
+#County Level Data
+county_data <- atl %>%
+  filter( county_fips %in%  c(13121, 13089, 13135))
+  
+
+```
+
+## Metro Characteristics
+
+```{r}
+
+#Atlanta Metro
+
+#Place Data
+indicator <- acs_dem %>% 
+  pivot_wider(names_from = variable, 
+                values_from = value) %>%
+    mutate(other = other + pacific) %>%
+  select(-pacific) %>%
+  mutate('AIAN %' = aian/total,
+          'Asian %' = asian/total,
+           'Black %' = black/total,
+         'Hispanic %' = hisp/total,
+         'White %' = white/total,
+         'Other %' = other/total) %>%
+  select(-race_cat, -total) %>% 
+  rename(geoid = GEOID) %>%
+  right_join(municip, by = "geoid") %>%
+  arrange(yr_incorp) %>%
+  left_join(acs_tract, by = c("geoid", "NAME")) %>%
+  mutate(NAME = str_remove_all(NAME, " city, Georgia"))  %>%
+   select(-muniname, -c(census_id_pid6:placecity, lat, long, geoid)) %>%
+  select(NAME, yr_incorp, everything()) %>%
+  rename('Median income, 2022 dollars' = med_inc,
+         'Incorporation Year' = yr_incorp,
+         'City' = 'NAME')
+
+
+#County Data
+
+indicator_county <- acs_dem_county %>% 
+  pivot_wider(names_from = variable, 
+                values_from = value) %>%
+    mutate(other = other + pacific+multi) %>%
+  select(-pacific) %>%
+  mutate('AIAN %' = aian/total,
+          'Asian %' = asian/total,
+           'Black %' = black/total,
+         'Hispanic %' = hisp/total,
+         'White %' = white/total,
+         'Other Race %' = other/total) %>%
+  select(-race_cat, -total) %>% 
+  rename(geoid = GEOID) %>%
+  filter(geoid %in% c(13121, 13089, 13135)) %>%
+  left_join(acs_county, by = c("geoid", "NAME")) %>%
+  select(NAME, everything(), -geoid) %>%
+  rename('Median income, 2022 dollars' = med_inc, County = NAME)
+
+
+```
+
+## Exporting and Creating Tables
+
+```{r}
+
+print(indicator)
+write_xlsx(indicator, path = 'exports/city_table.xlsx')
+
+print(indicator_county)
+write_xlsx(indicator_county, path = 'exports/county_table.xlsx')
+```
